@@ -1,6 +1,10 @@
 // Package tailsampler buffers whole traces and decides once the trace has
 // aged out, so a decision sees every span of the trace.
 //
+// Rules are keep conditions in priority order. Error and latency rules abstain
+// when their condition does not hold, so the final probabilistic rule is what
+// catches everything else; without one, unmatched traces are dropped.
+//
 // Memory is bounded by policy.MaxTraces. When the buffer is full the oldest
 // open trace is evicted undecided and counted as overflow, which is the
 // cheapest honest failure: newer traces are usually the ones being debugged.
@@ -176,12 +180,9 @@ func (s *Sampler) decide(t *trace) Outcome {
 		SpanErrs: t.spanErrs,
 	}
 	s.tracesFinished.Add(1)
-	if rule, keep := s.apply(t, o.Duration); rule != nil {
-		o.Kept = keep
-		o.Reason = rule.Name
-	} else {
-		o.Reason = "no-match"
-	}
+	reason, keep := s.apply(t, o.Duration)
+	o.Kept = keep
+	o.Reason = reason
 	if o.Kept {
 		s.tracesKept.Add(1)
 	} else {
@@ -190,9 +191,9 @@ func (s *Sampler) decide(t *trace) Outcome {
 	return o
 }
 
-// apply evaluates the first rule matching the service and reports whether it
-// keeps the trace.
-func (s *Sampler) apply(t *trace, d time.Duration) (*policy.Rule, bool) {
+// apply walks the rules in priority order. Error and latency rules that do not
+// fire abstain; a probabilistic rule always decides, so it belongs last.
+func (s *Sampler) apply(t *trace, d time.Duration) (reason string, keep bool) {
 	for i := range s.pol.Rules {
 		r := &s.pol.Rules[i]
 		if !r.Matches(t.service) {
@@ -200,14 +201,18 @@ func (s *Sampler) apply(t *trace, d time.Duration) (*policy.Rule, bool) {
 		}
 		switch r.Kind {
 		case policy.KindError:
-			return r, t.spanErrs > 0 && s.roll(r.Rate)
+			if t.spanErrs > 0 && s.roll(r.Rate) {
+				return r.Name, true
+			}
 		case policy.KindLatency:
-			return r, d >= r.Threshold()
+			if d >= r.Threshold() {
+				return r.Name, true
+			}
 		case policy.KindProbabilistic:
-			return r, s.roll(r.Rate)
+			return r.Name, s.roll(r.Rate)
 		}
 	}
-	return nil, false
+	return "no-match", false
 }
 
 func (s *Sampler) roll(rate float64) bool { return s.rnd.Float64() < rate }
