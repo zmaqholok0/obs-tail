@@ -57,7 +57,7 @@ type Policy struct {
 	// WaitMS is how long a trace is buffered before the rules run.
 	WaitMS int `json:"wait_ms"`
 	// MaxTraces bounds memory; the oldest open trace is evicted first.
-	MaxTraces int   `json:"max_traces"`
+	MaxTraces int    `json:"max_traces"`
 	Rules     []Rule `json:"rules"`
 }
 
