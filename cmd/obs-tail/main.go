@@ -1,10 +1,11 @@
 package main
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zmaqholok0/obs-tail/internal/guard"
 	"github.com/zmaqholok0/obs-tail/internal/otlpjson"
 	"github.com/zmaqholok0/obs-tail/internal/policy"
 	"github.com/zmaqholok0/obs-tail/internal/tailsampler"
@@ -34,6 +36,8 @@ func run() error {
 	cfgPath := flag.String("config", "config.json", "path to the JSON policy file")
 	listen := flag.String("listen", ":4318", "OTLP/HTTP listen address")
 	upstream := flag.String("upstream", "", "OTLP/HTTP JSON endpoint for kept traces; stdout when empty")
+	highWater := flag.Float64("high-water", 0.8, "buffer fill fraction above which ingest sheds traces")
+	shedPercent := flag.Int("shed-percent", 25, "percent of trace ids kept while above --high-water")
 	flag.Parse()
 
 	pol, err := policy.Load(*cfgPath)
@@ -41,6 +45,10 @@ func run() error {
 		return err
 	}
 	sampler, err := tailsampler.New(pol, time.Now().UnixNano())
+	if err != nil {
+		return err
+	}
+	gate, err := guard.New(*highWater, *shedPercent)
 	if err != nil {
 		return err
 	}
@@ -64,8 +72,8 @@ func run() error {
 	}()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/traces", ingest(sampler))
-	mux.HandleFunc("GET /metrics", metrics(sampler))
+	mux.HandleFunc("POST /v1/traces", ingest(sampler, gate, pol.MaxTraces))
+	mux.HandleFunc("GET /metrics", metrics(sampler, gate))
 	srv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	errCh := make(chan error, 1)
@@ -89,8 +97,10 @@ func run() error {
 	return nil
 }
 
-// ingest accepts one OTLP/HTTP JSON request and buffers its spans.
-func ingest(sampler *tailsampler.Sampler) http.HandlerFunc {
+// ingest accepts one OTLP/HTTP JSON request and buffers its spans. While the
+// buffer is above the guard's high-water mark whole traces are shed here,
+// before they can cost memory.
+func ingest(sampler *tailsampler.Sampler, gate *guard.Guard, maxTraces int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 		if err != nil {
@@ -102,17 +112,34 @@ func ingest(sampler *tailsampler.Sampler) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		sampler.Add(spans)
+		open := sampler.Stats().OpenTraces
+		admitted := spans[:0]
+		for _, sp := range spans {
+			if gate.Allow(sp.TraceID, open, maxTraces) {
+				admitted = append(admitted, sp)
+			}
+		}
+		sampler.Add(admitted)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, "{}")
 	}
 }
 
-func metrics(sampler *tailsampler.Sampler) http.HandlerFunc {
+func metrics(sampler *tailsampler.Sampler, gate *guard.Guard) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = io.WriteString(w, sampler.Stats().String())
+		shed, admitted := guardStats(gate)
+		_, _ = fmt.Fprintf(w, "# HELP obs_tail_guard_traces_shed Traces shed at ingest under buffer pressure.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE obs_tail_guard_traces_shed counter\nobs_tail_guard_traces_shed %d\n", shed)
+		_, _ = fmt.Fprintf(w, "# HELP obs_tail_guard_traces_admitted Traces admitted by the guard.\n")
+		_, _ = fmt.Fprintf(w, "# TYPE obs_tail_guard_traces_admitted counter\nobs_tail_guard_traces_admitted %d\n", admitted)
 	}
+}
+
+func guardStats(gate *guard.Guard) (shed, admitted uint64) {
+	admitted, shed = gate.Stats()
+	return shed, admitted
 }
 
 func dispatch(sampler *tailsampler.Sampler, fw *forwarder) {

@@ -56,14 +56,20 @@ hit `max_traces` and the oldest undecided trace was discarded.
 
 ### Policy
 
-Rules run in order and the **first match decides** - a later rule never sees a
-trace that an earlier one matched. Kinds:
+Rules are keep conditions evaluated in priority order, and the **first rule
+that fires decides** - a trace an earlier rule kept never reaches a later one.
+`error` and `latency` rules abstain when the trace does not qualify, so they
+cost nothing for happy-path traffic. `probabilistic` always decides and belongs
+last; without it every trace no rule keeps is dropped.
 
 | kind            | keeps when                                  |
 |-----------------|---------------------------------------------|
 | `error`         | the trace has a failed span, at `rate`      |
 | `latency`       | the trace is slower than `threshold_ms`     |
 | `probabilistic` | always, at `rate`                           |
+
+`rate` on an `error` rule is the fraction of *error traces* kept, so `1.0`
+keeps all of them.
 
 `service_pattern` is a `path.Match` glob over `service.name`; omit it to match
 every service. Put the specific rules first and one probabilistic rule last:
@@ -80,6 +86,21 @@ every service. Put the specific rules first and one probabilistic rule last:
   ]
 }
 ```
+
+### Overflow guard
+
+Hard limits are worse than slow degradation: a full buffer drops the oldest
+undecided trace, which is usually the one being debugged. The guard keeps the
+buffer off that wall. Once open traces pass `--high-water` of `max_traces`, new
+traces are shed at ingest by trace-id hash, keeping `--shed-percent` of them.
+The hash is sticky, so a retried trace is never half-buffered.
+
+```
+./obs-tail --config config.json --high-water 0.8 --shed-percent 25
+```
+
+`obs_tail_guard_traces_shed` moving off zero means the buffer is undersized,
+the rules keep too much, or `wait_ms` lets traces pile up.
 
 ### Cost notes
 
