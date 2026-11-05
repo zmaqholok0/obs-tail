@@ -1,0 +1,17 @@
+# binaries
+/obs-tail
+/bin/
+
+# local config, sample captures
+config.json
+sample-trace.json
+
+# test and coverage output
+*.test
+*.out
+coverage.txt
+
+# editor and OS noise
+.idea/
+.vscode/
+.DS_Store
