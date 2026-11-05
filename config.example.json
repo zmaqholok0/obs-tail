@@ -1,0 +1,22 @@
+{
+  "wait_ms": 3000,
+  "max_traces": 20000,
+  "rules": [
+    {
+      "name": "errors-are-kept",
+      "kind": "error",
+      "rate": 1.0
+    },
+    {
+      "name": "slow-checkout",
+      "kind": "latency",
+      "threshold_ms": 800,
+      "service_pattern": "checkout-*"
+    },
+    {
+      "name": "tail-of-everything",
+      "kind": "probabilistic",
+      "rate": 0.05
+    }
+  ]
+}
